@@ -1,0 +1,8 @@
+# Compiled binaries
+/hris-llvm
+
+# Generated LLVM IR files
+*.ll
+out.ll
+
+
