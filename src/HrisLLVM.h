@@ -68,9 +68,9 @@ class HrisLLVM {
             return builder->CreateGlobalString(exp.value);
 
          case ASTType::SYMBOL: {
-            auto envVariable = env->lookup(exp.value);
-            auto globalVar = llvm::cast<llvm::GlobalVariable>(envVariable);
-            return builder->CreateLoad(globalVar->getValueType(), globalVar, exp.value);
+            auto alloc = env->lookup(exp.value);
+            auto allocaInst = llvm::cast<llvm::AllocaInst>(alloc);
+            return builder->CreateLoad(allocaInst->getAllocatedType(), alloc, exp.value);
          }
 
          case ASTType::LIST: {
@@ -99,13 +99,73 @@ class HrisLLVM {
                   auto name = exp.list[1].value;
                   auto val = gen(exp.list[2], env);
 
-                  auto envVariable = new llvm::GlobalVariable(
-                     *module, val->getType(), false,
-                     llvm::GlobalValue::ExternalLinkage,
-                     llvm::cast<llvm::Constant>(val), name
-                  );
-                  env->define(name, envVariable);
+                  // 1. Allocate space on the stack for an i32 (or val->getType())
+                  auto alloc = builder->CreateAlloca(val->getType(), nullptr, name);
+
+                  // 2. Store the evaluated initial value into the stack slot
+                  builder->CreateStore(val, alloc);
+
+                  // 3. Register the stack pointer in the environment
+                  env->define(name, alloc);
+
                   return val;
+               }
+
+               if (op == "set") {
+                  auto name = exp.list[1].value;
+                  auto newVal = gen(exp.list[2], env);
+
+                  // 1. Look up the existing stack allocation pointer from env
+                  auto alloc = env->lookup(name);
+
+                  // 2. Overwrite the stack slot with the new value
+                  builder->CreateStore(newVal, alloc);
+
+                  return newVal;
+               }
+
+               if (op == "<" || op == ">" || op == "==") {
+                  auto lhs = gen(exp.list[1], env);
+                  auto rhs = gen(exp.list[2], env);
+
+                  if (op == "<")  return builder->CreateICmpSLT(lhs, rhs, "cmptmp");
+                  if (op == ">")  return builder->CreateICmpSGT(lhs, rhs, "cmptmp");
+                  if (op == "==") return builder->CreateICmpEQ(lhs, rhs, "cmptmp");
+               }
+
+               if (op == "if") {
+                  // 1. Reserve stack memory for the result of the if-expression
+                  auto resultAlloc = builder->CreateAlloca(builder->getInt32Ty(), nullptr, "ifresult");
+
+                  // 2. Evaluate condition expression (returns i1)
+                  auto condVal = gen(exp.list[1], env);
+
+                  // 3. Retrieve reference to current active function
+                  auto currentFn = builder->GetInsertBlock()->getParent();
+
+                  // 4. Create the basic blocks
+                  auto thenBB  = createBB("then", currentFn);
+                  auto elseBB  = createBB("else", currentFn);
+                  auto mergeBB = createBB("merge", currentFn);
+
+                  // 5. Emit conditional jump from entry block to then or else block
+                  builder->CreateCondBr(condVal, thenBB, elseBB);
+
+                  // THEN BLOCK
+                  builder->SetInsertPoint(thenBB);
+                  auto thenVal = gen(exp.list[2], env);
+                  builder->CreateStore(thenVal, resultAlloc);
+                  builder->CreateBr(mergeBB); // Jump to merge block
+
+                  // ELSE BLOCK
+                  builder->SetInsertPoint(elseBB);
+                  auto elseVal = gen(exp.list[3], env);
+                  builder->CreateStore(elseVal, resultAlloc);
+                  builder->CreateBr(mergeBB); // Jump to merge block
+
+                  // MERGE BLOCK
+                  builder->SetInsertPoint(mergeBB);
+                  return builder->CreateLoad(builder->getInt32Ty(), resultAlloc, "iftmp");
                }
 
                if (op == "printf"){

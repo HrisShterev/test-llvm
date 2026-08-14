@@ -28,6 +28,13 @@ std::vector<Token> tokenize(const std::string& input) {
     while (i < input.size()) {
         if (std::isspace(input[i])) { i++; continue; }
 
+        if (input[i] == ';') {
+            while (i < input.size() && input[i] != '\n') {
+                i++;
+            }
+            continue;
+        }
+
         if (input[i] == '(') {
             tokens.push_back({TokenType::LPAREN, "("});
             i++;
