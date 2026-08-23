@@ -69,8 +69,12 @@ class HrisLLVM {
 
          case ASTType::SYMBOL: {
             auto alloc = env->lookup(exp.value);
-            auto allocaInst = llvm::cast<llvm::AllocaInst>(alloc);
-            return builder->CreateLoad(allocaInst->getAllocatedType(), alloc, exp.value);
+            
+            // If it's an Alloca (stack slot), load its value
+            if (auto allocaInst = llvm::dyn_cast<llvm::AllocaInst>(alloc)) {
+               return builder->CreateLoad(allocaInst->getAllocatedType(), alloc, exp.value);
+            }
+            return alloc;
          }
 
          case ASTType::LIST: {
@@ -97,29 +101,46 @@ class HrisLLVM {
 
                if (op == "var") {
                   auto name = exp.list[1].value;
+
+                  std::string className = "";
+                  if (exp.list[2].type == ASTType::LIST && exp.list[2].list[0].value == "new") {
+                     className = exp.list[2].list[1].value; // e.g., "Point"
+                  }
+
                   auto val = gen(exp.list[2], env);
 
-                  // 1. Allocate space on the stack for an i32 (or val->getType())
                   auto alloc = builder->CreateAlloca(val->getType(), nullptr, name);
-
-                  // 2. Store the evaluated initial value into the stack slot
                   builder->CreateStore(val, alloc);
 
-                  // 3. Register the stack pointer in the environment
-                  env->define(name, alloc);
+                  // Pass className here so env stores it in typeRecord!
+                  env->define(name, alloc, className);
 
                   return val;
                }
 
                if (op == "set") {
-                  auto name = exp.list[1].value;
+                  llvm::Value* targetPtr = nullptr;
+
+                  // Case A: Setting a property, e.g., (set (prop p x) 10)
+                  if (exp.list[1].type == ASTType::LIST && exp.list[1].list[0].value == "prop") {
+                     auto propExpr = exp.list[1];
+                     std::string varName = propExpr.list[1].value;
+                     std::string fieldName = propExpr.list[2].value;
+
+                     std::string className = env->getType(varName);
+                     auto instancePtr = gen(propExpr.list[1], env);
+                     int fieldIdx = getFieldIndex(className, fieldName);
+                     auto structTy = llvm::StructType::getTypeByName(builder->getContext(), "class." + className);
+
+                     targetPtr = builder->CreateStructGEP(structTy, instancePtr, fieldIdx, fieldName + "ptr");
+                  } 
+                  // Case B: Setting a normal variable, e.g., (set x 10)
+                  else {
+                     targetPtr = env->lookup(exp.list[1].value);
+                  }
+
                   auto newVal = gen(exp.list[2], env);
-
-                  // 1. Look up the existing stack allocation pointer from env
-                  auto alloc = env->lookup(name);
-
-                  // 2. Overwrite the stack slot with the new value
-                  builder->CreateStore(newVal, alloc);
+                  builder->CreateStore(newVal, targetPtr);
 
                   return newVal;
                }
@@ -148,13 +169,20 @@ class HrisLLVM {
                   return builder->CreateSDiv(lhs, rhs, "divtmp");
                }
 
-               if (op == "<" || op == ">" || op == "==") {
+               if (op == "<" || op == ">" || op == "==" || op == "<=" || op == ">=" || op == "!=") {
                   auto lhs = gen(exp.list[1], env);
                   auto rhs = gen(exp.list[2], env);
+
+                  llvm::Value* cmp = nullptr;
 
                   if (op == "<")  return builder->CreateICmpSLT(lhs, rhs, "cmptmp");
                   if (op == ">")  return builder->CreateICmpSGT(lhs, rhs, "cmptmp");
                   if (op == "==") return builder->CreateICmpEQ(lhs, rhs, "cmptmp");
+                  if (op == "<=") return builder->CreateICmpSLE(lhs, rhs, "cmptmp");
+                  if (op == ">=") return builder->CreateICmpSGE(lhs, rhs, "cmptmp");
+                  if (op == "!=") return builder->CreateICmpNE(lhs, rhs, "cmptmp");
+
+                  return builder->CreateZExt(cmp, builder->getInt32Ty(), "booltmp");
                }
 
                if (op == "while") 
@@ -169,10 +197,21 @@ class HrisLLVM {
 
                   builder->CreateBr(condBB);
 
-
                   builder->SetInsertPoint(condBB);
                   auto condVal = gen(exp.list[1], env);
-                  builder->CreateCondBr(condVal, bodyBB, afterBB);
+                  
+                  llvm::Value* condBool = nullptr;
+                  if (condVal->getType()->isIntegerTy(1)) {
+                     condBool = condVal;
+                  } else {
+                     condBool = builder->CreateICmpNE(
+                           condVal, 
+                           builder->getInt32(0), 
+                           "whilecond"
+                     );
+                  }
+
+                  builder->CreateCondBr(condBool, bodyBB, afterBB);
 
                   // body BLOCK
                   builder->SetInsertPoint(bodyBB);
@@ -184,23 +223,87 @@ class HrisLLVM {
                   return builder->getInt32(0);
                }
 
+               if (op == "class") {
+                  std::string className = exp.list[1].value;
+                  auto fieldList = exp.list[2].list;
+
+                  std::vector<std::string> fieldNames;
+                  std::vector<llvm::Type*> fieldTypes;
+
+                  for (auto& fieldNode : fieldList) {
+                     fieldNames.push_back(fieldNode.value);
+                     fieldTypes.push_back(builder->getInt32Ty());
+                  }
+
+                  // Save metadata for field index lookups
+                  classFields[className] = fieldNames;
+
+                  llvm::StructType::create(builder->getContext(), fieldTypes, "class." + className);
+                  return builder->getInt32(0);
+               }
+
+               if (op == "new") {
+                  std::string className = exp.list[1].value;
+
+                  auto structTy = llvm::StructType::getTypeByName(builder->getContext(), "class." + className);
+                  if (!structTy) {
+                     llvm::report_fatal_error(llvm::Twine("Unknown class: ") + className);
+                  }
+
+                  auto alloc = builder->CreateAlloca(structTy, nullptr, "instance");
+
+                  // Return the instance pointer. 
+                  return alloc;
+               }
+
+               if (op == "prop") {
+                  if (exp.list[1].type != ASTType::SYMBOL) {
+                     llvm::report_fatal_error("Property access targets must be variable names.");
+                  }
+
+                  std::string varName = exp.list[1].value; 
+                  std::string fieldName = exp.list[2].value;
+
+                  std::string className = env->getType(varName);
+
+                  auto instancePtr = gen(exp.list[1], env);
+                  int fieldIdx = getFieldIndex(className, fieldName);
+                  auto structTy = llvm::StructType::getTypeByName(builder->getContext(), "class." + className);
+
+                  auto fieldPtr = builder->CreateStructGEP(structTy, instancePtr, fieldIdx, fieldName + "ptr");
+
+                  // LOAD the integer value from the pointer!
+                  return builder->CreateLoad(builder->getInt32Ty(), fieldPtr, fieldName + "val");
+               }
+
                if (op == "if") {
-                  // 1. Reserve stack memory for the result of the if-expression
+                  // Reserve stack memory for the result of the if-expression
                   auto resultAlloc = builder->CreateAlloca(builder->getInt32Ty(), nullptr, "ifresult");
 
-                  // 2. Evaluate condition expression (returns i1)
+                  // Evaluate condition expression (returns i1)
                   auto condVal = gen(exp.list[1], env);
 
-                  // 3. Retrieve reference to current active function
+                  llvm::Value* condBool = nullptr;
+                  if (condVal->getType()->isIntegerTy(1)) {
+                     condBool = condVal;
+                  } else {
+                     condBool = builder->CreateICmpNE(
+                           condVal, 
+                           builder->getInt32(0), 
+                           "ifcond"
+                     );
+                  }
+                  
+                  // Retrieve reference to current active function
                   auto currentFn = builder->GetInsertBlock()->getParent();
 
-                  // 4. Create the basic blocks
+                  // Create the basic blocks
                   auto thenBB  = createBB("then", currentFn);
                   auto elseBB  = createBB("else", currentFn);
                   auto mergeBB = createBB("merge", currentFn);
 
-                  // 5. Emit conditional jump from entry block to then or else block
-                  builder->CreateCondBr(condVal, thenBB, elseBB);
+                  // Emit conditional jump from entry block to then or else block
+                  builder->CreateCondBr(condBool, thenBB, elseBB);
 
                   // THEN BLOCK
                   builder->SetInsertPoint(thenBB);
@@ -310,6 +413,14 @@ class HrisLLVM {
       return builder->getInt32(0);
    }
 
+   int getFieldIndex(const std::string& className, const std::string& fieldName) {
+      auto& fields = classFields[className];
+      for (size_t i = 0; i < fields.size(); ++i) {
+         if (fields[i] == fieldName) return i;
+      }
+      llvm::report_fatal_error(llvm::Twine("Unknown field: ") + fieldName);
+   }
+
    void setupExternFunctions() {
       // int printf(const char* format, ...);
       auto printfType = llvm::FunctionType::get(
@@ -365,6 +476,8 @@ class HrisLLVM {
       llvm::raw_fd_ostream outLL(fileName, errorCode);
       module->print(outLL, nullptr);
    }
+
+   std::unordered_map<std::string, std::vector<std::string>> classFields;
    std::shared_ptr<Enviroment> env;
    std::unique_ptr<Parser> parser;
    

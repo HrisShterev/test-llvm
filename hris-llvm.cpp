@@ -4,21 +4,26 @@
 int main() {
     std::string program = R"(
         (begin
-            ;; Define a function 'square' that takes one parameter 'x'
-            (def square (x)
-                (* x x)
-            )
+            ;; 1. Class Declaration
+            ;; Defines a 'Point' class with two properties: 'x' (index 0) and 'y' (index 1)
+            (class Point (x y))
 
-            ;; Define a function 'sumOfSquares' that calls 'square'
-            (def sumOfSquares (a b)
-                (+ (square a) (square b))
-            )
+            ;; 2. Instantiation
+            ;; Creates a new 'Point' instance on the stack and stores its pointer in 'p'
+            (var p (new Point))
 
-            ;; Call the function and store the result
-            (var result (sumOfSquares 3 4))
+            ;; 3. Setting Properties
+            ;; Computes offset for 'x' (slot 0) and stores 10
+            (set (prop p x) 10)
 
-            ;; Print the result (3^2 + 4^2 = 9 + 16 = 25)
-            (printf "Result is: %d\n" result)
+            ;; Computes offset for 'y' (slot 1) and stores 20
+            (set (prop p y) 20)
+
+            ;; 4. Accessing Properties
+            ;; Reads values back using (prop p x) and (prop p y)
+            (printf "Point coordinates: x = %d, y = %d\n" 
+                    (prop p x) 
+                    (prop p y))
         )
     )";
 

@@ -18,9 +18,12 @@ class Enviroment
         record = rec;
     }
 
-    void define(const std::string& name, llvm::Value* value)
+    void define(const std::string& name, llvm::Value* value, const std::string& typeName = "")
     { 
         record[name] = value;
+        if (!typeName.empty()) {
+            typeRecord[name] = typeName;
+        }
     }
 
     llvm::Value* lookup(const std::string& name){
@@ -32,8 +35,17 @@ class Enviroment
         else return record[name];
     }
 
+    std::string getType(const std::string& name) {
+        if (typeRecord.find(name) != typeRecord.end()) {
+            return typeRecord[name];
+        }
+        if (parent != nullptr) return parent->getType(name);
+        llvm::report_fatal_error("Unknown type for variable: " + name);
+    }
+
  private:
 
+    std::unordered_map<std::string, std::string> typeRecord;
     std::map<std::string, llvm::Value*>  record;
     std::shared_ptr<Enviroment> parent;
 };
