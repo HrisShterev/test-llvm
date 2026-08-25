@@ -1,0 +1,30 @@
+name: Test HrisLLVM Compiler Features
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test-compiler:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install LLVM & Clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 llvm-18-dev clang-18 build-essential
+
+      - name: Build Compiler Test Suite
+        run: |
+          clang++-18 -std=c++17 test_runner.cpp \
+            $(llvm-config-18 --cxxflags --ldflags --system-libs --libs core native) \
+            -I. -o run_tests
+
+      - name: Run Test Suite
+        run: |
+          ./run_tests
