@@ -145,44 +145,30 @@ class HrisLLVM {
                   return newVal;
                }
 
-               if (op == "+") {
-                  auto lhs = gen(exp.list[1], env);
-                  auto rhs = gen(exp.list[2], env);
-                  return builder->CreateAdd(lhs, rhs, "addtmp");
-               }
-
-               if (op == "-") {
-                  auto lhs = gen(exp.list[1], env);
-                  auto rhs = gen(exp.list[2], env);
-                  return builder->CreateSub(lhs, rhs, "subtmp");
-               }
-
-               if (op == "*") {
-                  auto lhs = gen(exp.list[1], env);
-                  auto rhs = gen(exp.list[2], env);
-                  return builder->CreateMul(lhs, rhs, "multmp");
-               }
-
-               if (op == "/") {
-                  auto lhs = gen(exp.list[1], env);
-                  auto rhs = gen(exp.list[2], env);
-                  return builder->CreateSDiv(lhs, rhs, "divtmp");
-               }
-
                if (op == "<" || op == ">" || op == "==" || op == "<=" || op == ">=" || op == "!=") {
                   auto lhs = gen(exp.list[1], env);
                   auto rhs = gen(exp.list[2], env);
 
                   llvm::Value* cmp = nullptr;
 
-                  if (op == "<")  return builder->CreateICmpSLT(lhs, rhs, "cmptmp");
-                  if (op == ">")  return builder->CreateICmpSGT(lhs, rhs, "cmptmp");
-                  if (op == "==") return builder->CreateICmpEQ(lhs, rhs, "cmptmp");
-                  if (op == "<=") return builder->CreateICmpSLE(lhs, rhs, "cmptmp");
-                  if (op == ">=") return builder->CreateICmpSGE(lhs, rhs, "cmptmp");
-                  if (op == "!=") return builder->CreateICmpNE(lhs, rhs, "cmptmp");
+                  if (op == "<")  cmp = builder->CreateICmpSLT(lhs, rhs, "cmptmp");
+                  if (op == ">")  cmp = builder->CreateICmpSGT(lhs, rhs, "cmptmp");
+                  if (op == "==") cmp = builder->CreateICmpEQ(lhs, rhs, "cmptmp");
+                  if (op == "<=") cmp = builder->CreateICmpSLE(lhs, rhs, "cmptmp");
+                  if (op == ">=") cmp = builder->CreateICmpSGE(lhs, rhs, "cmptmp");
+                  if (op == "!=") cmp = builder->CreateICmpNE(lhs, rhs, "cmptmp");
 
                   return builder->CreateZExt(cmp, builder->getInt32Ty(), "booltmp");
+               }
+
+               if (op == "+" || op == "-" || op == "*" || op == "/") {
+                  auto lhs = gen(exp.list[1], env);
+                  auto rhs = gen(exp.list[2], env);
+
+                  if (op == "+") return builder->CreateAdd(lhs, rhs, "addtmp");
+                  if (op == "-") return builder->CreateSub(lhs, rhs, "subtmp");
+                  if (op == "*") return builder->CreateMul(lhs, rhs, "multmp");
+                  if (op == "/") return builder->CreateSDiv(lhs, rhs, "divtmp");
                }
 
                if (op == "while") 
@@ -325,12 +311,26 @@ class HrisLLVM {
                if (op == "def")
                {
                   auto funcName = exp.list[1].value;
+                  std::string className = "";
+                  std::string methodName = funcName;
+
+                  size_t dotPos = funcName.find('.');
+
+                  if (dotPos != std::string::npos) {
+                     className = funcName.substr(0, dotPos);
+                     
+                     methodName = funcName.substr(dotPos + 1);
+                  }
+                  
+
                   auto paramsList = exp.list[2].list;
 
                   std::vector<llvm::Type*> paramTypes;
                   std::vector<std::string> paramNames;
                   for (auto& param : paramsList) {
-                     paramTypes.push_back(builder->getInt32Ty());
+                     if (param.value == "self" || param.value == "this") paramTypes.push_back(builder->getPtrTy());
+                     else paramTypes.push_back(builder->getInt32Ty());
+                     
                      paramNames.push_back(param.value);
                   }
 
@@ -355,11 +355,11 @@ class HrisLLVM {
                      arg.setName(paramName);
 
                      // Allocate local stack memory for the argument
-                     auto alloc = builder->CreateAlloca(builder->getInt32Ty(), nullptr, paramName);
+                     auto alloc = builder->CreateAlloca(arg.getType(), nullptr, paramName);
                      builder->CreateStore(&arg, alloc);
 
-                     // Register in local environment
-                     fnEnv->define(paramName, alloc);
+                     if(paramName == "self" && !className.empty()) fnEnv->define(paramName, alloc, className);
+                     else fnEnv->define(paramName, alloc);
                   }
 
                   auto bodyVal = gen(exp.list[3], fnEnv);
@@ -400,11 +400,32 @@ class HrisLLVM {
 
                // Evaluate all argument expressions (from index 1 onwards)
                std::vector<llvm::Value*> args;
-               for (size_t i = 1; i < exp.list.size(); ++i) {
-                  args.push_back(gen(exp.list[i], env));
-               }
+               auto funcType = calleeFunc->getFunctionType();
 
-               // Emit the LLVM call instruction
+               for (size_t i = 1; i < exp.list.size(); ++i) {
+                  size_t paramIdx = i - 1;
+                  auto argAST = exp.list[i];
+
+                  // Check if this parameter is a pointer type (like 'self' ptr)
+                  bool isPtrParam = (paramIdx < calleeFunc->arg_size()) && 
+                                    funcType->getParamType(paramIdx)->isPointerTy();
+
+                  if (isPtrParam && argAST.type == ASTType::SYMBOL) {
+                     // Look up 'p' in the environment to get its memory slot
+                     auto alloc = env->lookup(argAST.value);
+
+                     // Load the pointer address stored inside 'p'
+                     auto loadedPtr = builder->CreateLoad(
+                        builder->getPtrTy(), 
+                        alloc, 
+                        argAST.value + ".ptr"
+                     );
+                     args.push_back(loadedPtr);
+                  } else {
+                     // Standard argument evaluation for numbers, additions, etc.
+                     args.push_back(gen(argAST, env));
+                  }
+               }
                return builder->CreateCall(calleeFunc, args, "calltmp");
             }
          }

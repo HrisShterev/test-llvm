@@ -18,12 +18,13 @@ class Enviroment
         record = rec;
     }
 
-    void define(const std::string& name, llvm::Value* value, const std::string& typeName = "")
-    { 
+    void define(const std::string& name, llvm::Value* value) {
         record[name] = value;
-        if (!typeName.empty()) {
-            typeRecord[name] = typeName;
-        }
+    }
+    
+    void define(const std::string& name, llvm::Value* value, const std::string& className) {
+        record[name] = value;
+        typeRecord[name] = className;
     }
 
     llvm::Value* lookup(const std::string& name){
