@@ -100,6 +100,30 @@ int main() {
         )
     )", "Sum of coordinates: 30\n");
 
+    // Test: Heap Allocation & Auto-Constructor Dispatch
+    runTest("Heap Allocation & Constructor", R"(
+        (begin
+            (class Point (x y))
+
+            ;; Constructor initializes x and y
+            (def Point.init (self startX startY)
+                (begin
+                    (set (prop self x) startX)
+                    (set (prop self y) startY)
+                )
+            )
+
+            (def Point.sum (self)
+                (+ (prop self x) (prop self y))
+            )
+
+            ;; Instantiates on heap and automatically invokes Point.init(self, 15, 25)
+            (var p (new Point 15 25))
+
+            (printf "Constructor result: %d\n" (Point.sum p))
+        )
+    )", "Constructor result: 40\n");
+
     std::cout << "All Compiler Feature Tests Passed Successfully!\n";
     return 0;
 }

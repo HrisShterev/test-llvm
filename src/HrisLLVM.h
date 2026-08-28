@@ -106,7 +106,6 @@ class HrisLLVM {
                   if (exp.list[2].type == ASTType::LIST && exp.list[2].list[0].value == "new") {
                      className = exp.list[2].list[1].value; // e.g., "Point"
                   }
-
                   auto val = gen(exp.list[2], env);
 
                   auto alloc = builder->CreateAlloca(val->getType(), nullptr, name);
@@ -231,15 +230,49 @@ class HrisLLVM {
                if (op == "new") {
                   std::string className = exp.list[1].value;
 
+                  // 1. Get the class struct type
                   auto structTy = llvm::StructType::getTypeByName(builder->getContext(), "class." + className);
                   if (!structTy) {
                      llvm::report_fatal_error(llvm::Twine("Unknown class: ") + className);
                   }
 
-                  auto alloc = builder->CreateAlloca(structTy, nullptr, "instance");
+                  // 2. Create a null pointer of type structTy*
+                  auto nullPtr = llvm::ConstantPointerNull::get(builder->getPtrTy());
 
-                  // Return the instance pointer. 
-                  return alloc;
+                  // 3. Compute the offset to index 1 (the end of the first struct)
+                  auto gep = builder->CreateGEP(
+                     structTy, 
+                     nullPtr, 
+                     builder->getInt32(1), 
+                     "struct_size_gep"
+                  );
+
+                  // 4. Convert the pointer address into an i64 integer for malloc
+                  llvm::Value* sizeValue = builder->CreatePtrToInt(
+                     gep, 
+                     builder->getInt64Ty(), 
+                     "struct_size_bytes"
+                  );
+
+                  auto mallocFn = module->getFunction("malloc");
+                  auto raw_heap_ptr = builder->CreateCall(mallocFn, {sizeValue}, "raw_heap_ptr");
+
+                  std::vector<llvm::Value*> initArgs;
+                  initArgs.push_back(raw_heap_ptr);
+                  for(auto i = 2; i < exp.list.size(); i++)
+                  {
+                     auto arg = gen(exp.list[i], env);
+                     initArgs.push_back(arg);
+                  }
+
+                  std::string initName = className + ".init";
+                  auto initFunc = module->getFunction(initName);
+
+                  if(initFunc)
+                  {
+                     builder->CreateCall(initFunc, initArgs);
+                  }
+                  return raw_heap_ptr;
                }
 
                if (op == "prop") {
@@ -442,16 +475,23 @@ class HrisLLVM {
       llvm::report_fatal_error(llvm::Twine("Unknown field: ") + fieldName);
    }
 
-   void setupExternFunctions() {
-      // int printf(const char* format, ...);
-      auto printfType = llvm::FunctionType::get(
-          builder->getInt32Ty(),
-          {builder->getPtrTy()},
-          true // variadic (...)
-      );
+void setupExternFunctions() {
+   // int printf(const char* format, ...);
+   auto printfType = llvm::FunctionType::get(
+       builder->getInt32Ty(),
+       {builder->getPtrTy()},
+       true
+   );
+   module->getOrInsertFunction("printf", printfType);
 
-      module->getOrInsertFunction("printf", printfType);
-   }
+   // ptr malloc(i64 size);
+   auto mallocType = llvm::FunctionType::get(
+       builder->getPtrTy(),
+       {builder->getInt64Ty()},
+       false
+   );
+   module->getOrInsertFunction("malloc", mallocType);
+}
 
    void moduleInit() {
       env = std::make_shared<Enviroment>(

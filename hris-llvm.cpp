@@ -4,16 +4,24 @@
 int main() {
     std::string program = R"(
         (begin
-        (class Point (x y))
+            (class Point (x y))
 
-        (def Point.sum (self)
-            (+ (prop self x) (prop self y)))
+            ;; Constructor initializes x and y
+            (def Point.init (self startX startY)
+                (begin
+                    (set (prop self x) startX)
+                    (set (prop self y) startY)
+                )
+            )
 
-        (var p (new Point))
-        (set (prop p x) 10)
-        (set (prop p y) 20)
+            (def Point.sum (self)
+                (+ (prop self x) (prop self y))
+            )
 
-        (printf "Sum of coordinates: %d\n" (Point.sum p))
+            ;; Instantiates on heap and automatically invokes Point.init(self, 15, 25)
+            (var p (new Point 15 25))
+
+            (printf "Constructor result: %d\n" (Point.sum p))
         )
     )";
 
