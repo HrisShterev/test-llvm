@@ -209,37 +209,58 @@ class HrisLLVM {
                }
 
                if (op == "class") {
-                  std::string className = exp.list[1].value;
-                  auto fieldList = exp.list[2].list;
+               std::string className = exp.list[1].value;
 
-                  std::vector<std::string> fieldNames;
-                  std::vector<llvm::Type*> fieldTypes;
+               std::vector<std::string> fieldNames;
+               fieldNames.push_back("vptr");
 
-                  for (auto& fieldNode : fieldList) {
-                     fieldNames.push_back(fieldNode.value);
-                     fieldTypes.push_back(builder->getInt32Ty());
+               std::string parentName = extractParentName(exp);
+               if (!parentName.empty()) {
+                  if (classFields.find(parentName) == classFields.end()) {
+                     llvm::report_fatal_error(llvm::Twine("Unknown parent class: ") + parentName);
                   }
-
-                  // Save metadata for field index lookups
-                  classFields[className] = fieldNames;
-
-                  llvm::StructType::create(builder->getContext(), fieldTypes, "class." + className);
-                  return builder->getInt32(0);
+                  
+                  const auto& parentFields = classFields[parentName];
+                  fieldNames.insert(fieldNames.end(), parentFields.begin() + 1, parentFields.end());
                }
+
+               const ASTNode& fieldListAST = extractFieldList(exp);
+               for (const auto& fieldNode : fieldListAST.list) {
+                  fieldNames.push_back(fieldNode.value);
+               }
+               
+               std::vector<llvm::Type*> fieldTypes;
+               fieldTypes.push_back(builder->getPtrTy()); // vptr
+               for (size_t i = 1; i < fieldNames.size(); ++i) {
+                  fieldTypes.push_back(builder->getInt32Ty());
+               }
+
+               // Save metadata for field index lookups
+               classFields[className] = fieldNames;
+
+               llvm::StructType::create(builder->getContext(), fieldTypes, "class." + className);
+
+               if (!parentName.empty() && classMethods.count(parentName)) {
+                  // Copy parent's method ordering so slot indices remain identical
+                  classMethods[className] = classMethods[parentName];
+               }
+
+               return builder->getInt32(0);
+            }
 
                if (op == "new") {
                   std::string className = exp.list[1].value;
 
-                  // 1. Get the class struct type
+                  // Get the class struct type
                   auto structTy = llvm::StructType::getTypeByName(builder->getContext(), "class." + className);
                   if (!structTy) {
                      llvm::report_fatal_error(llvm::Twine("Unknown class: ") + className);
                   }
 
-                  // 2. Create a null pointer of type structTy*
+                  // Create a null pointer of type structTy*
                   auto nullPtr = llvm::ConstantPointerNull::get(builder->getPtrTy());
 
-                  // 3. Compute the offset to index 1 (the end of the first struct)
+                  // Compute the offset to index 1 (the end of the first struct)
                   auto gep = builder->CreateGEP(
                      structTy, 
                      nullPtr, 
@@ -247,7 +268,7 @@ class HrisLLVM {
                      "struct_size_gep"
                   );
 
-                  // 4. Convert the pointer address into an i64 integer for malloc
+                  // Convert the pointer address into an i64 integer for malloc
                   llvm::Value* sizeValue = builder->CreatePtrToInt(
                      gep, 
                      builder->getInt64Ty(), 
@@ -256,6 +277,13 @@ class HrisLLVM {
 
                   auto mallocFn = module->getFunction("malloc");
                   auto raw_heap_ptr = builder->CreateCall(mallocFn, {sizeValue}, "raw_heap_ptr");
+
+                  // Store vptr into field 0
+                  auto vptrSlot = builder->CreateStructGEP(structTy, raw_heap_ptr, 0, "vptr_slot");
+                 auto vtableGlobal = getOrEmitVTable(className);
+                  if (vtableGlobal) {
+                     builder->CreateStore(vtableGlobal, vptrSlot);
+                  }
 
                   std::vector<llvm::Value*> initArgs;
                   initArgs.push_back(raw_heap_ptr);
@@ -276,23 +304,19 @@ class HrisLLVM {
                }
 
                if (op == "prop") {
-                  if (exp.list[1].type != ASTType::SYMBOL) {
-                     llvm::report_fatal_error("Property access targets must be variable names.");
-                  }
-
-                  std::string varName = exp.list[1].value; 
                   std::string fieldName = exp.list[2].value;
 
+                  auto instancePtr = gen(exp.list[1], env);
+
+                  std::string varName = exp.list[1].value; 
                   std::string className = env->getType(varName);
 
-                  auto instancePtr = gen(exp.list[1], env);
                   int fieldIdx = getFieldIndex(className, fieldName);
                   auto structTy = llvm::StructType::getTypeByName(builder->getContext(), "class." + className);
 
-                  auto fieldPtr = builder->CreateStructGEP(structTy, instancePtr, fieldIdx, fieldName + "ptr");
+                  auto fieldPtr = builder->CreateStructGEP(structTy, instancePtr, fieldIdx, fieldName + "_ptr");
 
-                  // LOAD the integer value from the pointer!
-                  return builder->CreateLoad(builder->getInt32Ty(), fieldPtr, fieldName + "val");
+                  return builder->CreateLoad(builder->getInt32Ty(), fieldPtr, fieldName + "_val");
                }
 
                if (op == "if") {
@@ -345,16 +369,19 @@ class HrisLLVM {
                {
                   auto funcName = exp.list[1].value;
                   std::string className = "";
-                  std::string methodName = funcName;
-
+                  
                   size_t dotPos = funcName.find('.');
-
                   if (dotPos != std::string::npos) {
                      className = funcName.substr(0, dotPos);
-                     
-                     methodName = funcName.substr(dotPos + 1);
+                     std::string methodName = funcName.substr(dotPos + 1);
+
+                     auto& methods = classMethods[className];
+
+                     auto it = std::find(methods.begin(), methods.end(), methodName);
+                     if (it == methods.end()) {
+                           methods.push_back(methodName);
+                     }
                   }
-                  
 
                   auto paramsList = exp.list[2].list;
 
@@ -467,31 +494,121 @@ class HrisLLVM {
       return builder->getInt32(0);
    }
 
-   int getFieldIndex(const std::string& className, const std::string& fieldName) {
-      auto& fields = classFields[className];
-      for (size_t i = 0; i < fields.size(); ++i) {
-         if (fields[i] == fieldName) return i;
+   llvm::GlobalVariable* getOrEmitVTable(const std::string& className) {
+      std::string vtableName = "vtable." + className;
+      auto existing = module->getNamedGlobal(vtableName);
+      if (existing) return existing;
+
+      std::vector<llvm::Constant*> vtableElems;
+      
+      // Lookup parent name if any
+      std::string parentName = "";
+      // Find parent from class hierarchy if tracked, or search methods
+      
+      for (const auto& method : classMethods[className]) {
+         std::string fullFnName = className + "." + method;
+         auto func = module->getFunction(fullFnName);
+         
+         // Fallback to parent method if child didn't override
+         if (!func) {
+            for (const auto& [cName, methods] : classMethods) {
+               auto parentFunc = module->getFunction(cName + "." + method);
+               if (parentFunc) {
+                  func = parentFunc;
+                  break;
+               }
+            }
+         }
+
+         if (func) {
+            vtableElems.push_back(func);
+         }
       }
-      llvm::report_fatal_error(llvm::Twine("Unknown field: ") + fieldName);
+
+      auto arrayTy = llvm::ArrayType::get(builder->getPtrTy(), vtableElems.size());
+      auto vtableInit = vtableElems.empty() 
+         ? llvm::ConstantAggregateZero::get(arrayTy) 
+         : llvm::ConstantArray::get(arrayTy, vtableElems);
+
+      return new llvm::GlobalVariable(
+         *module,
+         arrayTy,
+         true,
+         llvm::GlobalValue::ExternalLinkage,
+         vtableInit,
+         vtableName
+      );
    }
 
-void setupExternFunctions() {
-   // int printf(const char* format, ...);
-   auto printfType = llvm::FunctionType::get(
-       builder->getInt32Ty(),
-       {builder->getPtrTy()},
-       true
-   );
-   module->getOrInsertFunction("printf", printfType);
+   std::string extractParentName(const ASTNode& exp) {
+      if (exp.list.size() > 2 && exp.list[2].type == ASTType::LIST) {
+         const auto& specifier = exp.list[2].list;
+         
+         if (!specifier.empty() && specifier[0].value == "extends" && specifier.size() > 1) {
+               return specifier[1].value;
+         }
+      }
+      return "";
+   }
 
-   // ptr malloc(i64 size);
-   auto mallocType = llvm::FunctionType::get(
-       builder->getPtrTy(),
-       {builder->getInt64Ty()},
-       false
-   );
-   module->getOrInsertFunction("malloc", mallocType);
-}
+   const ASTNode& extractFieldList(const ASTNode& exp) {
+      // If exp.list[2] is (extends Parent), fields are at exp.list[3]
+      if (exp.list.size() > 2 && exp.list[2].type == ASTType::LIST &&
+         !exp.list[2].list.empty() && exp.list[2].list[0].value == "extends") {
+         return exp.list[3];
+      }
+      
+      // Otherwise fields are at exp.list[2]
+      return exp.list[2];
+   }
+
+   int getFieldIndex(const std::string& className, const std::string& fieldName) {
+      if (classFields.find(className) == classFields.end()) {
+         llvm::report_fatal_error(llvm::Twine("Unknown class: ") + className);
+      }
+
+      const auto& fields = classFields[className];
+      for (size_t i = 0; i < fields.size(); ++i) {
+         if (fields[i] == fieldName) {
+               return static_cast<int>(i);
+         }
+      }
+
+      llvm::report_fatal_error(llvm::Twine("Field '") + fieldName + "' not found in class " + className);
+   }
+
+   int getMethodIndex(const std::string& className, const std::string& methodName) {
+      if (classMethods.find(className) == classMethods.end()) {
+         llvm::report_fatal_error(llvm::Twine("Unknown class: ") + className);
+      }
+
+      const auto& methods = classMethods[className];
+      for (size_t i = 0; i < methods.size(); ++i) {
+         if (methods[i] == methodName) {
+               return static_cast<int>(i);
+         }
+      }
+
+      llvm::report_fatal_error(llvm::Twine("Method '") + methodName + "' not found in class " + className);
+   }
+   
+   void setupExternFunctions() {
+      // int printf(const char* format, ...);
+      auto printfType = llvm::FunctionType::get(
+         builder->getInt32Ty(),
+         {builder->getPtrTy()},
+         true
+      );
+      module->getOrInsertFunction("printf", printfType);
+
+      // ptr malloc(i64 size);
+      auto mallocType = llvm::FunctionType::get(
+         builder->getPtrTy(),
+         {builder->getInt64Ty()},
+         false
+      );
+      module->getOrInsertFunction("malloc", mallocType);
+   }
 
    void moduleInit() {
       env = std::make_shared<Enviroment>(
@@ -539,6 +656,7 @@ void setupExternFunctions() {
    }
 
    std::unordered_map<std::string, std::vector<std::string>> classFields;
+   std::unordered_map<std::string, std::vector<std::string>> classMethods;
    std::shared_ptr<Enviroment> env;
    std::unique_ptr<Parser> parser;
    
