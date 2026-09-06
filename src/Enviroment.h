@@ -17,14 +17,12 @@ class Enviroment
         parent = par;
         record = rec;
     }
-
-    void define(const std::string& name, llvm::Value* value) {
-        record[name] = value;
-    }
     
-    void define(const std::string& name, llvm::Value* value, const std::string& className) {
+    void define(const std::string& name, llvm::Value* value, const std::string& className = "") {
         record[name] = value;
-        typeRecord[name] = className;
+        if (!className.empty()) {
+            typeRecord[name] = className;
+        }
     }
 
     llvm::Value* lookup(const std::string& name){
@@ -37,11 +35,15 @@ class Enviroment
     }
 
     std::string getType(const std::string& name) {
-        if (typeRecord.find(name) != typeRecord.end()) {
+        // Check local record, but ONLY return if non-empty
+        if (typeRecord.find(name) != typeRecord.end() && !typeRecord[name].empty()) {
             return typeRecord[name];
         }
-        if (parent != nullptr) return parent->getType(name);
-        llvm::report_fatal_error("Unknown type for variable: " + name);
+        // Walk up parent environment chain recursively
+        if (parent != nullptr) {
+            return parent->getType(name);
+        }
+        return "";
     }
 
  private:

@@ -41,7 +41,7 @@ class HrisLLVM {
 
  private:
    void compile(const ASTNode& ast) {
-      // 1. Create main() function signature returning i32
+      // 1. Create main() function returning i32
       fn = createFunction(
          "main", 
          llvm::FunctionType::get(builder->getInt32Ty(), false)
@@ -50,10 +50,10 @@ class HrisLLVM {
       // 2. Generate IR for the body
       gen(ast, env);
 
-      // 3. Main always returns exit code 0
+      // 3. ALWAYS return 0 so the process exits with status code 0 (Success)
       builder->CreateRet(builder->getInt32(0));
 
-      // Verify function AFTER body and return statements are created
+      // Verify function
       llvm::verifyFunction(*fn);
    }
 
@@ -208,45 +208,170 @@ class HrisLLVM {
                   return builder->getInt32(0);
                }
 
-               if (op == "class") {
-               std::string className = exp.list[1].value;
+               if (op == "send") {
+                  // (send obj methodName arg1 arg2)
+                  auto objAST = exp.list[1];
+                  std::string methodName = exp.list[2].value;
 
-               std::vector<std::string> fieldNames;
-               fieldNames.push_back("vptr");
+                  // Evaluate the target object to get its heap pointer (%self)
+                  auto objVal = gen(objAST, env);
 
-               std::string parentName = extractParentName(exp);
-               if (!parentName.empty()) {
-                  if (classFields.find(parentName) == classFields.end()) {
-                     llvm::report_fatal_error(llvm::Twine("Unknown parent class: ") + parentName);
+                  // Fetch the class name associated with the object type to resolve slot index
+                  std::string className = env->getType(objAST.value);
+                  if (className.empty()) {
+                     // Fallback: If not found by variable name, infer from method metadata
+                     for (const auto& [cName, methods] : classMethods) {
+                        if (std::find(methods.begin(), methods.end(), methodName) != methods.end()) {
+                           className = cName;
+                           break;
+                        }
+                     }
                   }
-                  
-                  const auto& parentFields = classFields[parentName];
-                  fieldNames.insert(fieldNames.end(), parentFields.begin() + 1, parentFields.end());
+
+                  // Find the method's slot index in classMethods
+                  const auto& methods = classMethods[className];
+                  auto it = std::find(methods.begin(), methods.end(), methodName);
+                  if (it == methods.end()) {
+                     llvm::report_fatal_error(llvm::Twine("Method not found in class: ") + methodName);
+                  }
+                  size_t slotIdx = std::distance(methods.begin(), it);
+
+                  // Extract vptr (Field 0) from the object instance
+                  auto vptrSlot = builder->CreateStructGEP(
+                     llvm::StructType::getTypeByName(builder->getContext(), "class." + className),
+                     objVal,
+                     0,
+                     "vptr_slot"
+                  );
+                  auto vtablePtr = builder->CreateLoad(builder->getPtrTy(), vptrSlot, "vtable_ptr");
+
+                  // Index into the vtable array at slotIdx
+                  auto methodSlot = builder->CreateConstGEP1_32(
+                     builder->getPtrTy(),
+                     vtablePtr,
+                     slotIdx,
+                     "method_slot"
+                  );
+                  auto funcPtr = builder->CreateLoad(builder->getPtrTy(), methodSlot, "func_ptr");
+
+                  // Build arguments list (prepend objVal as 'self')
+                  std::vector<llvm::Value*> args;
+                  args.push_back(objVal); // First arg is always explicit 'self'
+
+                  std::vector<llvm::Type*> paramTypes;
+                  paramTypes.push_back(builder->getPtrTy()); // self
+
+                  for (size_t i = 3; i < exp.list.size(); ++i) {
+                     auto argVal = gen(exp.list[i], env);
+                     args.push_back(argVal);
+                     paramTypes.push_back(argVal->getType());
+                  }
+
+                  // Define function type for indirect invocation and call
+                  auto fnType = llvm::FunctionType::get(builder->getInt32Ty(), paramTypes, false);
+                  return builder->CreateCall(fnType, funcPtr, args, "send_tmp");
                }
 
-               const ASTNode& fieldListAST = extractFieldList(exp);
-               for (const auto& fieldNode : fieldListAST.list) {
-                  fieldNames.push_back(fieldNode.value);
+               if (op == "super") {
+                  std::string methodName = exp.list[1].value;
+
+                  // Use the class context set during 'def' processing
+                  std::string classCtx = this->currentClass;
+                  if (classCtx.empty()) {
+                     // Fallback check on 'self' type record
+                     classCtx = env->getType("self");
+                  }
+
+                  if (classCtx.empty()) {
+                     llvm::report_fatal_error(
+                           "Cannot execute 'super': Class context is unknown in current scope."
+                     );
+                  }
+
+                  auto parentIt = classParents.find(classCtx);
+                  if (parentIt == classParents.end() || parentIt->second.empty()) {
+                     llvm::report_fatal_error(
+                        llvm::Twine("Cannot execute 'super': Class '") + classCtx + "' has no parent class registered in classParents."
+                     );
+                  }
+
+                  std::string parentClass = parentIt->second;
+                  std::string parentFnName = parentClass + "." + methodName; // e.g. "Point.init"
+                  auto parentFunc = module->getFunction(parentFnName);
+
+                  if (!parentFunc) {
+                     llvm::report_fatal_error(
+                        llvm::Twine("Parent method symbol not found in module: ") + parentFnName
+                     );
+                  }
+
+                  // Load 'self' argument pointer
+                  auto selfAlloc = env->lookup("self");
+                  auto selfVal = builder->CreateLoad(builder->getPtrTy(), selfAlloc, "self_val");
+
+                  std::vector<llvm::Value*> args;
+                  args.push_back(selfVal);
+
+                  for (size_t i = 2; i < exp.list.size(); ++i) {
+                     args.push_back(gen(exp.list[i], env));
+                  }
+
+                  return builder->CreateCall(parentFunc, args, "super_tmp");
                }
-               
-               std::vector<llvm::Type*> fieldTypes;
-               fieldTypes.push_back(builder->getPtrTy()); // vptr
-               for (size_t i = 1; i < fieldNames.size(); ++i) {
-                  fieldTypes.push_back(builder->getInt32Ty());
+
+               if (op == "class") {
+                  std::string className = exp.list[1].value;
+
+                  std::vector<std::string> fieldNames;
+                  fieldNames.push_back("vptr"); // Index 0: vtable pointer
+
+                  // 1. Extract parent class name via helper function
+                  std::string parentName = extractParentName(exp);
+
+                  // 2. Select field list AST node based on whether a parent exists
+                  ASTNode fieldListAST;
+                  if (!parentName.empty()) {
+                     // If extending a parent, fields are at index 3: (class Point3D (extends Point) (z))
+                     fieldListAST = (exp.list.size() > 3) ? exp.list[3] : ASTNode();
+                  } else {
+                     // If no parent, fields are at index 2: (class Point (x y))
+                     fieldListAST = (exp.list.size() > 2) ? exp.list[2] : ASTNode();
+                  }
+
+                  // 3. Handle Parent Inheritance
+                  if (!parentName.empty()) {
+                     if (classFields.find(parentName) == classFields.end()) {
+                           llvm::report_fatal_error(llvm::Twine("Unknown parent class: ") + parentName);
+                     }
+
+                     this->classParents[className] = parentName;
+                     this->classMethods[className] = this->classMethods[parentName];
+
+                     const auto& parentFields = classFields[parentName];
+                     fieldNames.insert(fieldNames.end(), parentFields.begin() + 1, parentFields.end());
+                  }
+
+                  // 4. Extract class-specific fields
+                  if (fieldListAST.type == ASTType::LIST) {
+                     for (const auto& fieldNode : fieldListAST.list) {
+                           fieldNames.push_back(fieldNode.value);
+                     }
+                  }
+
+                  // 5. Register class fields and create LLVM struct type
+                  classFields[className] = fieldNames;
+
+                  std::vector<llvm::Type*> fieldTypes;
+                  fieldTypes.push_back(builder->getPtrTy()); // Index 0: vptr
+
+                  for (size_t i = 1; i < fieldNames.size(); ++i) {
+                     fieldTypes.push_back(builder->getInt32Ty());
+                  }
+
+                  auto structTy = llvm::StructType::create(*ctx, fieldTypes, "class." + className);
+
+                  return builder->getInt32(0);
                }
-
-               // Save metadata for field index lookups
-               classFields[className] = fieldNames;
-
-               llvm::StructType::create(builder->getContext(), fieldTypes, "class." + className);
-
-               if (!parentName.empty() && classMethods.count(parentName)) {
-                  // Copy parent's method ordering so slot indices remain identical
-                  classMethods[className] = classMethods[parentName];
-               }
-
-               return builder->getInt32(0);
-            }
 
                if (op == "new") {
                   std::string className = exp.list[1].value;
@@ -365,8 +490,7 @@ class HrisLLVM {
                   return builder->CreateLoad(builder->getInt32Ty(), resultAlloc, "iftmp");
                }
 
-               if (op == "def")
-               {
+               if (op == "def") {
                   auto funcName = exp.list[1].value;
                   std::string className = "";
                   
@@ -376,7 +500,6 @@ class HrisLLVM {
                      std::string methodName = funcName.substr(dotPos + 1);
 
                      auto& methods = classMethods[className];
-
                      auto it = std::find(methods.begin(), methods.end(), methodName);
                      if (it == methods.end()) {
                            methods.push_back(methodName);
@@ -388,9 +511,11 @@ class HrisLLVM {
                   std::vector<llvm::Type*> paramTypes;
                   std::vector<std::string> paramNames;
                   for (auto& param : paramsList) {
-                     if (param.value == "self" || param.value == "this") paramTypes.push_back(builder->getPtrTy());
-                     else paramTypes.push_back(builder->getInt32Ty());
-                     
+                     if (param.value == "self" || param.value == "this") {
+                           paramTypes.push_back(builder->getPtrTy());
+                     } else {
+                           paramTypes.push_back(builder->getInt32Ty());
+                     }
                      paramNames.push_back(param.value);
                   }
 
@@ -403,7 +528,6 @@ class HrisLLVM {
                   );
 
                   auto prevBB = builder->GetInsertBlock();
-                  
                   auto entryBB = createBB("entry", func);
                   builder->SetInsertPoint(entryBB);
 
@@ -414,15 +538,31 @@ class HrisLLVM {
                      std::string paramName = paramNames[idx++];
                      arg.setName(paramName);
 
-                     // Allocate local stack memory for the argument
                      auto alloc = builder->CreateAlloca(arg.getType(), nullptr, paramName);
                      builder->CreateStore(&arg, alloc);
 
-                     if(paramName == "self" && !className.empty()) fnEnv->define(paramName, alloc, className);
-                     else fnEnv->define(paramName, alloc);
+                     if ((paramName == "self" || paramName == "this") && !className.empty()) {
+                           fnEnv->define(paramName, alloc, className);
+                     } else {
+                           fnEnv->define(paramName, alloc);
+                     }
                   }
 
+                  std::string prevClass = this->currentClass;
+                  if (!className.empty()) {
+                     this->currentClass = className;
+                  }
+
+                  // Compile function body
                   auto bodyVal = gen(exp.list[3], fnEnv);
+
+                  this->currentClass = prevClass;
+
+                  // Safely convert pointer return expressions (like returning 'self') to i32
+                  if (bodyVal->getType()->isPointerTy()) {
+                     bodyVal = builder->CreatePtrToInt(bodyVal, builder->getInt32Ty(), "ret_cast");
+                  }
+
                   builder->CreateRet(bodyVal);
 
                   if (prevBB) {
@@ -445,6 +585,7 @@ class HrisLLVM {
                   // Emit printf call and return the CallInst value
                   return builder->CreateCall(printfFn, args);
                }
+               // User Function Calls
                std::string calleeName = exp.list[0].value;
 
                llvm::Function* calleeFunc = module->getFunction(calleeName);
@@ -458,34 +599,28 @@ class HrisLLVM {
                   );
                }
 
-               // Evaluate all argument expressions (from index 1 onwards)
                std::vector<llvm::Value*> args;
                auto funcType = calleeFunc->getFunctionType();
 
+               // Single clean loop over arguments
                for (size_t i = 1; i < exp.list.size(); ++i) {
                   size_t paramIdx = i - 1;
                   auto argAST = exp.list[i];
 
-                  // Check if this parameter is a pointer type (like 'self' ptr)
-                  bool isPtrParam = (paramIdx < calleeFunc->arg_size()) && 
-                                    funcType->getParamType(paramIdx)->isPointerTy();
+                  // Always evaluate argument uniformly via gen()
+                  llvm::Value* argVal = gen(argAST, env);
+                  llvm::Type* expectedType = funcType->getParamType(paramIdx);
 
-                  if (isPtrParam && argAST.type == ASTType::SYMBOL) {
-                     // Look up 'p' in the environment to get its memory slot
-                     auto alloc = env->lookup(argAST.value);
-
-                     // Load the pointer address stored inside 'p'
-                     auto loadedPtr = builder->CreateLoad(
-                        builder->getPtrTy(), 
-                        alloc, 
-                        argAST.value + ".ptr"
-                     );
-                     args.push_back(loadedPtr);
-                  } else {
-                     // Standard argument evaluation for numbers, additions, etc.
-                     args.push_back(gen(argAST, env));
+                  // Cast type mismatch if function expects ptr vs i32
+                  if (expectedType->isPointerTy() && argVal->getType()->isIntegerTy()) {
+                     argVal = builder->CreateIntToPtr(argVal, expectedType, "arg_ptr_cast");
+                  } else if (expectedType->isIntegerTy() && argVal->getType()->isPointerTy()) {
+                     argVal = builder->CreatePtrToInt(argVal, expectedType, "arg_int_cast");
                   }
+
+                  args.push_back(argVal);
                }
+
                return builder->CreateCall(calleeFunc, args, "calltmp");
             }
          }
@@ -657,6 +792,9 @@ class HrisLLVM {
 
    std::unordered_map<std::string, std::vector<std::string>> classFields;
    std::unordered_map<std::string, std::vector<std::string>> classMethods;
+   std::map<std::string, std::string> classParents;
+   std::string currentClass;
+
    std::shared_ptr<Enviroment> env;
    std::unique_ptr<Parser> parser;
    

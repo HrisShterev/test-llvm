@@ -172,6 +172,46 @@ int main() {
         )
     )", "Point sum: 30\nPoint3D sum: 60\nUpdated Point3D sum: 150\n");
 
+    runTest("VTable Dispatch & Super Calls (Main Return 90)", R"(
+        (begin
+            (class Point (x y))
+
+            (def Point.init (self startX startY)
+                (begin
+                    (set (prop self x) startX)
+                    (set (prop self y) startY)
+                    self
+                )
+            )
+
+            (def Point.norm (self)
+                (+ (prop self x) (prop self y))
+            )
+
+            (class Point3D (extends Point) (z))
+
+            (def Point3D.init (self startX startY startZ)
+                (begin
+                    (super init startX startY)
+                    (set (prop self z) startZ)
+                    self
+                )
+            )
+
+            (def Point3D.norm (self)
+                (+ (super norm) (prop self z))
+            )
+
+            (var p2d (new Point 10 20))
+            (var p3d (new Point3D 10 20 30))
+
+            (var norm2D (send p2d norm))
+            (var norm3D (send p3d norm))
+
+            (printf "%d\n" (+ norm2D norm3D))
+        )
+    )", "90\n");
+
     std::cout << "All Compiler Feature Tests Passed Successfully!\n";
     return 0;
 }
